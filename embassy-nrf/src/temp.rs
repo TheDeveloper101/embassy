@@ -3,12 +3,98 @@
 use core::future::poll_fn;
 use core::task::Poll;
 
-use embassy_hal_internal::drop::OnDrop;
 use embassy_sync::waitqueue::AtomicWaker;
+
+use abacus_registers::{heliod, process_register_block};
 
 use crate::interrupt::InterruptExt;
 use crate::peripherals::TEMP;
 use crate::{Peri, interrupt, pac};
+
+#[process_register_block(
+    peripheral_name = "Nrf5xTemp",
+    backend = external(pac::temp::Temp),
+    states = [
+        (Off, cost: temp_off),
+        (Reading, *T*, cost: temp_reading)
+    ],
+    transitions = [Off => Reading, Reading => Off]
+)]
+struct Nrf5xTempModel;
+
+#[heliod(Nrf5xTempCost)]
+mod checked {
+    use super::*;
+    use abacus_registers::heliod_operation;
+
+    #[heliod_operation(
+        peripheral = super::Nrf5xTempCost,
+        from = Off,
+        to = Reading,
+        cost = temp_start
+    )]
+    pub(super) fn start(registers: Nrf5xTempRegisters<Off>) -> Nrf5xTempRegisters<Reading> {
+        let peripheral = *registers.peripheral();
+        peripheral.intenset().write(|w| w.set_datardy(true));
+        peripheral.tasks_start().write_value(1);
+        registers.into_reading()
+    }
+
+    #[heliod_operation(
+        peripheral = super::Nrf5xTempCost,
+        from = Reading,
+        to = Reading,
+        cost = temp_interrupt
+    )]
+    pub(super) fn handle_interrupt() {
+        pac::TEMP.intenclr().write(|w| w.set_datardy(true));
+        WAKER.wake();
+    }
+
+    #[heliod_operation(
+        peripheral = super::Nrf5xTempCost,
+        from = Reading,
+        to = Reading,
+        cost = temp_poll
+    )]
+    pub(super) fn data_ready(registers: &Nrf5xTempRegisters<Reading>) -> bool {
+        registers.peripheral().events_datardy().read() != 0
+    }
+
+    #[heliod_operation(
+        peripheral = super::Nrf5xTempCost,
+        from = Reading,
+        to = Off,
+        cost = temp_complete
+    )]
+    pub(super) fn complete(registers: Nrf5xTempRegisters<Reading>) -> (Nrf5xTempRegisters<Off>, i32) {
+        let peripheral = *registers.peripheral();
+        peripheral.events_datardy().write_value(0);
+        let value = peripheral.temp().read() as i32;
+        (registers.into_off(), value)
+    }
+
+    #[heliod_operation(
+        peripheral = super::Nrf5xTempCost,
+        from = Reading,
+        to = Off,
+        cost = temp_cancel
+    )]
+    pub(super) fn cancel(registers: Nrf5xTempRegisters<Reading>) -> Nrf5xTempRegisters<Off> {
+        let peripheral = *registers.peripheral();
+        peripheral.tasks_stop().write_value(1);
+        peripheral.events_datardy().write_value(0);
+        registers.into_off()
+    }
+}
+
+impl abacus_registers::SyncState for Nrf5xTempRegisters<Reading> {
+    type SyncStateEnum = Nrf5xTempStateEnum;
+
+    fn sync_state(self) -> Self::SyncStateEnum {
+        checked::cancel(self).into()
+    }
+}
 
 /// Interrupt handler.
 pub struct InterruptHandler {
@@ -17,15 +103,14 @@ pub struct InterruptHandler {
 
 impl interrupt::typelevel::Handler<interrupt::typelevel::TEMP> for InterruptHandler {
     unsafe fn on_interrupt() {
-        let r = pac::TEMP;
-        r.intenclr().write(|w| w.set_datardy(true));
-        WAKER.wake();
+        checked::handle_interrupt();
     }
 }
 
 /// Builtin temperature sensor driver.
 pub struct Temp<'d> {
     _peri: Peri<'d, TEMP>,
+    registers: Option<Nrf5xTempRegisters<Off>>,
 }
 
 static WAKER: AtomicWaker = AtomicWaker::new();
@@ -40,7 +125,12 @@ impl<'d> Temp<'d> {
         interrupt::TEMP.unpend();
         unsafe { interrupt::TEMP.enable() };
 
-        Self { _peri }
+        Self {
+            _peri,
+            // SAFETY: `Peri` provides exclusive ownership and a newly claimed
+            // TEMP peripheral is not performing a measurement.
+            registers: Some(unsafe { Nrf5xTempRegisters::new(pac::TEMP) }),
+        }
     }
 
     /// Perform an asynchronous temperature measurement. The returned future
@@ -67,33 +157,49 @@ impl<'d> Temp<'d> {
     /// # };
     /// ```
     pub async fn read_celsius_x4(&mut self) -> i32 {
-        // In case the future is dropped, stop the task and reset events.
-        let on_drop = OnDrop::new(|| {
-            let t = Self::regs();
-            t.tasks_stop().write_value(1);
-            t.events_datardy().write_value(0);
-        });
+        let off = self
+            .registers
+            .take()
+            .expect("temperature measurement already in progress");
+        let reading = ReadingGuard {
+            registers: Some(checked::start(off)),
+            destination: &mut self.registers,
+        };
 
-        let t = Self::regs();
-        t.intenset().write(|w| w.set_datardy(true));
-        t.tasks_start().write_value(1);
-
-        let value = poll_fn(|cx| {
+        poll_fn(|cx| {
             WAKER.register(cx.waker());
-            if t.events_datardy().read() == 0 {
+            if !checked::data_ready(reading.registers()) {
                 Poll::Pending
             } else {
-                t.events_datardy().write_value(0);
-                let raw = t.temp().read();
-                Poll::Ready(raw as i32)
+                Poll::Ready(())
             }
         })
         .await;
-        on_drop.defuse();
-        value
+        reading.complete()
+    }
+}
+
+struct ReadingGuard<'a> {
+    registers: Option<Nrf5xTempRegisters<Reading>>,
+    destination: &'a mut Option<Nrf5xTempRegisters<Off>>,
+}
+
+impl ReadingGuard<'_> {
+    fn registers(&self) -> &Nrf5xTempRegisters<Reading> {
+        self.registers.as_ref().unwrap()
     }
 
-    fn regs() -> pac::temp::Temp {
-        pac::TEMP
+    fn complete(mut self) -> i32 {
+        let (registers, value) = checked::complete(self.registers.take().unwrap());
+        *self.destination = Some(registers);
+        value
+    }
+}
+
+impl Drop for ReadingGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(registers) = self.registers.take() {
+            *self.destination = Some(checked::cancel(registers));
+        }
     }
 }
