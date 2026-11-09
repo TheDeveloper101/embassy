@@ -3,16 +3,15 @@
 use core::future::poll_fn;
 use core::task::Poll;
 
+use abacus_registers::{heliod, process_register_block};
 use embassy_hal_internal::drop::OnDrop;
 use embassy_sync::waitqueue::AtomicWaker;
 #[cfg(feature = "time")]
-use embassy_time::{Duration, with_timeout};
-
-use abacus_registers::{heliod, process_register_block};
+use embassy_time::{with_timeout, Duration};
 
 use crate::interrupt::InterruptExt;
 use crate::peripherals::TEMP;
-use crate::{Peri, interrupt, pac};
+use crate::{interrupt, pac, Peri};
 
 #[process_register_block(
     peripheral_name = "Nrf5xTemp",
@@ -27,8 +26,9 @@ struct Nrf5xTempModel;
 
 #[heliod(Nrf5xTempCost)]
 mod checked {
-    use super::*;
     use abacus_registers::heliod_operation;
+
+    use super::*;
 
     #[heliod_operation(
         peripheral = super::Nrf5xTempCost,

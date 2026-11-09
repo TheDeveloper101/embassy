@@ -325,7 +325,7 @@ _nrf52832_anomaly_109 = []
 _multi_wdt = []
 
 [dependencies]
-abacus-registers = { git = "https://github.com/TheDeveloper101/abacus-registers.git", rev = "fc76cdfbf61d5d1a622d6e15b8f2fc103d6cda6c" }
+abacus-registers = { path = "../.." }
 embassy-time-driver = { version = "0.2.2", path = "../embassy-time-driver", optional = true }
 embassy-time-queue-utils = { version = "0.3.2", path = "../embassy-time-queue-utils", optional = true }
 embassy-time = { version = "0.5.1", path = "../embassy-time", optional = true }

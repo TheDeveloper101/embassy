@@ -31,6 +31,7 @@ embedded-hal-bus = { version = "0.3", features = ["async"] }
 num-integer = { version = "0.1.45", default-features = false }
 microfft = "0.6.0"
 portable-atomic = "1"
+abacus-registers = { path = "../../.." }
 
 [profile.release]
 debug = 2
