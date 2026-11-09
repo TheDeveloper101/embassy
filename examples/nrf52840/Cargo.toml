@@ -31,7 +31,7 @@ embedded-hal-bus = { version = "0.3", features = ["async"] }
 num-integer = { version = "0.1.45", default-features = false }
 microfft = "0.6.0"
 portable-atomic = "1"
-abacus-registers = { path = "../../.." }
+abacus-registers = { git = "https://github.com/TheDeveloper101/abacus-registers.git", rev = "1d35d23176b846f58c0bb50842dc6239d851eecb" }
 
 [profile.release]
 debug = 2
