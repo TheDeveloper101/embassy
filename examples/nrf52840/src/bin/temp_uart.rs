@@ -119,7 +119,7 @@ mod checked {
         resume(uart);
         write(uart, buffer).await;
         suspend(uart);
-        called = called + 1;
+        let called = called + 1;
     }
 
     /// Keeps one active UART session across the short independent command.
@@ -130,7 +130,7 @@ mod checked {
         short_independent_work(called);
         write(uart, buffer).await;
         suspend(uart);
-        called = called + 1;
+        let called = called + 1;
     }
 
     pub async fn optimized_loop(temp: &mut Temp<'_>, uart: &mut Uarte<'_, Async>, buffer: &mut [u8; 4]) {
