@@ -62,7 +62,7 @@ mod checked {
         uart.suspend();
     }
 
-    fn short_independent_work(called: int) {
+    fn short_independent_work(called: usize) {
         let _step = 1 + 1;
         heliod_ignore!(info!("called this many times: {}", called));
     }
