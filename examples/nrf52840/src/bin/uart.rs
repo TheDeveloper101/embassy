@@ -7,9 +7,46 @@ use embassy_executor::Spawner;
 use embassy_nrf::{bind_interrupts, peripherals, uarte};
 use panic_probe as _;
 
+use abacus_registers::{heliod, heliod_ignore, heliod_operation};
+use embassy_nrf::uarte::Nrf52UarteCost;
+
 bind_interrupts!(struct Irqs {
     UARTE0 => uarte::InterruptHandler<peripherals::UARTE0>;
 });
+
+#[heliod(Nrf52UarteCost)]
+mod checked {
+    use super::*;
+
+    #[heliod_operation(
+        peripheral = Nrf52UarteCost,
+        from = ActiveIdle,
+        to = ActiveIdle,
+        cost = 1310739
+    )]
+    async fn read(uart: &mut uarte::Uarte<'_, embassy_nrf::mode::Async>, buffer: &mut [u8]) {
+        unwrap!(uart.read(buffer).await);
+    }
+
+    #[heliod_operation(
+        peripheral = Nrf52UarteCost,
+        from = ActiveIdle,
+        to = ActiveIdle,
+        cost = 1310736
+    )]
+    async fn write(uart: &mut uarte::Uarte<'_, embassy_nrf::mode::Async>, buffer: &[u8]) {
+        unwrap!(uart.write(buffer).await);
+    }
+
+    pub async fn run(uart: &mut uarte::Uarte<'_, embassy_nrf::mode::Async>, buffer: &mut [u8]) {
+        loop {
+            heliod_ignore!(info!("reading..."));
+            read(uart, buffer).await;
+            heliod_ignore!(info!("writing..."));
+            write(uart, buffer).await;
+        }
+    }
+}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -28,11 +65,5 @@ async fn main(_spawner: Spawner) {
 
     unwrap!(uart.write(&buf).await);
     info!("wrote hello in uart!");
-
-    loop {
-        info!("reading...");
-        unwrap!(uart.read(&mut buf).await);
-        info!("writing...");
-        unwrap!(uart.write(&buf).await);
-    }
+    checked::run(&mut uart, &mut buf).await;
 }

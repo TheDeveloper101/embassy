@@ -15,17 +15,19 @@
 
 use core::future::poll_fn;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU8, Ordering};
 use core::task::Poll;
 
 use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
+#[cfg(feature = "time")]
+use embassy_time::{with_timeout, Duration};
 // Re-export SVD variants to allow user to directly set values.
 pub use pac::uarte::vals::{Baudrate, ConfigParity as Parity};
 
 use crate::chip::FORCE_COPY_BUFFER_SIZE;
-use crate::gpio::{self, AnyPin, DISCONNECTED, Pin as GpioPin, PselBits, SealedPin as _};
+use crate::gpio::{self, AnyPin, Pin as GpioPin, PselBits, SealedPin as _, DISCONNECTED};
 use crate::interrupt::typelevel::Interrupt;
 use crate::mode::{Async, Blocking, Mode};
 use crate::pac::gpio::vals as gpiovals;
@@ -35,6 +37,236 @@ use crate::ppi::{AnyConfigurableChannel, ConfigurableChannel, Event, Ppi, Task};
 use crate::timer::{Frequency, Instance as TimerInstance, Timer};
 use crate::util::slice_in_ram_or;
 use crate::{interrupt, pac};
+
+mod heliod_model {
+    use abacus_registers::process_register_block;
+
+    #[process_register_block(
+    peripheral_name = "Nrf52Uarte",
+    backend = external(super::pac::uarte::Uarte),
+    states = [
+        (Off, cost: 0),
+        (Active(RxIdle, TxIdle), ActiveIdle, cost: 1),
+        (Active(RxBusy, TxIdle), ActiveRx, *T*, cost: 4),
+        (Active(RxIdle, TxBusy), ActiveTx, *T*, cost: 4),
+        (Active(RxBusy, TxBusy), ActiveRxTx, *T*, cost: 7)
+    ],
+    transitions = [
+        Off => Active(RxIdle, TxIdle),
+        Active(RxIdle, TxIdle) => Off,
+        Active(RxIdle, TxIdle) => Active(RxBusy, TxIdle),
+        Active(RxBusy, TxIdle) => Active(RxIdle, TxIdle),
+        Active(RxIdle, TxIdle) => Active(RxIdle, TxBusy),
+        Active(RxIdle, TxBusy) => Active(RxIdle, TxIdle),
+        Active(RxBusy, TxIdle) => Active(RxBusy, TxBusy),
+        Active(RxBusy, TxBusy) => Active(RxBusy, TxIdle),
+        Active(RxIdle, TxBusy) => Active(RxBusy, TxBusy),
+        Active(RxBusy, TxBusy) => Active(RxIdle, TxBusy),
+        Active(RxBusy, TxBusy) => Active(RxIdle, TxIdle)
+    ]
+)]
+    struct Nrf52UarteModel;
+
+    impl abacus_registers::SyncState for Nrf52UarteRegisters<Active<RxBusy, TxIdle>> {
+        type SyncStateEnum = Nrf52UarteStateEnum;
+
+        fn sync_state(self) -> Self::SyncStateEnum {
+            super::reset_to_idle(*self.peripheral());
+            self.into_activeidle().into()
+        }
+    }
+
+    impl abacus_registers::SyncState for Nrf52UarteRegisters<Active<RxIdle, TxBusy>> {
+        type SyncStateEnum = Nrf52UarteStateEnum;
+
+        fn sync_state(self) -> Self::SyncStateEnum {
+            super::reset_to_idle(*self.peripheral());
+            self.into_activeidle().into()
+        }
+    }
+
+    impl abacus_registers::SyncState for Nrf52UarteRegisters<Active<RxBusy, TxBusy>> {
+        type SyncStateEnum = Nrf52UarteStateEnum;
+
+        fn sync_state(self) -> Self::SyncStateEnum {
+            super::reset_to_idle(*self.peripheral());
+            self.into_activeidle().into()
+        }
+    }
+}
+
+pub use heliod_model::Nrf52UarteCost;
+#[cfg(feature = "time")]
+use heliod_model::Nrf52UarteRegisters;
+
+#[allow(dead_code)]
+fn reset_to_idle(r: pac::uarte::Uarte) {
+    r.intenclr().write(|w| {
+        w.set_dmarxend(true);
+        w.set_dmatxend(true);
+        w.set_error(true);
+        w.set_rxto(true);
+    });
+    r.tasks_dma().rx().stop().write_value(1);
+    r.tasks_dma().tx().stop().write_value(1);
+    r.enable().write(|w| w.set_enable(vals::Enable::Disabled));
+    r.enable().write(|w| w.set_enable(vals::Enable::Enabled));
+}
+
+#[cfg(feature = "time")]
+#[abacus_registers::heliod(heliod_model::Nrf52UarteCost)]
+mod heliod_checked {
+    use abacus_registers::heliod_operation;
+
+    use super::*;
+
+    #[heliod_operation(
+        peripheral = super::heliod_model::Nrf52UarteCost,
+        from = ActiveIdle,
+        to = ActiveTx,
+        cost = 5
+    )]
+    fn start_tx(_registers: &Nrf52UarteRegisters, r: pac::uarte::Uarte, buffer: &[u8]) {
+        let ptr = buffer.as_ptr();
+        let len = buffer.len();
+        r.dma().tx().ptr().write_value(ptr as u32);
+        r.dma().tx().maxcnt().write(|w| w.set_maxcnt(len as _));
+        r.events_dma().tx().end().write_value(0);
+        r.intenset().write(|w| w.set_dmatxend(true));
+        compiler_fence(Ordering::SeqCst);
+        r.tasks_dma().tx().start().write_value(1);
+    }
+
+    #[heliod_operation(
+        peripheral = super::heliod_model::Nrf52UarteCost,
+        from = ActiveTx,
+        to = ActiveIdle,
+        cost = 2
+    )]
+    async fn finish_tx(_registers: &Nrf52UarteRegisters, r: pac::uarte::Uarte, state: &'static State) {
+        poll_fn(|cx| {
+            state.tx_waker.register(cx.waker());
+            if r.events_dma().tx().end().read() != 0 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        compiler_fence(Ordering::SeqCst);
+        r.events_dma().tx().ready().write_value(0);
+    }
+
+    #[heliod_operation(
+        peripheral = super::heliod_model::Nrf52UarteCost,
+        from = ActiveTx,
+        to = ActiveIdle,
+        cost = 6
+    )]
+    fn cancel_tx(_registers: &Nrf52UarteRegisters, r: pac::uarte::Uarte) {
+        reset_to_idle(r);
+        r.events_dma().tx().end().write_value(0);
+        r.events_dma().tx().ready().write_value(0);
+    }
+
+    pub(super) async fn write_from_ram(
+        registers: &Nrf52UarteRegisters,
+        r: pac::uarte::Uarte,
+        state: &'static State,
+        buffer: &[u8],
+    ) {
+        start_tx(registers, r, buffer);
+        let on_drop = OnDrop::new(|| cancel_tx(registers, r));
+        with_timeout(Duration::from_ticks(327_680), finish_tx(registers, r, state))
+            .await
+            .expect("UART transmit timed out");
+        on_drop.defuse();
+    }
+
+    #[heliod_operation(
+        peripheral = super::heliod_model::Nrf52UarteCost,
+        from = ActiveIdle,
+        to = ActiveRx,
+        cost = 6
+    )]
+    fn start_rx(_registers: &Nrf52UarteRegisters, r: pac::uarte::Uarte, state: &'static State, buffer: &mut [u8]) {
+        r.dma().rx().ptr().write_value(buffer.as_ptr() as u32);
+        r.dma().rx().maxcnt().write(|w| w.set_maxcnt(buffer.len() as _));
+        state.rx_on.store(true, Ordering::Relaxed);
+        r.events_rxto().write_value(0);
+        r.events_dma().rx().end().write_value(0);
+        r.events_error().write_value(0);
+        r.intenset().write(|w| {
+            w.set_dmarxend(true);
+            w.set_error(true);
+        });
+        compiler_fence(Ordering::SeqCst);
+        r.tasks_dma().rx().start().write_value(1);
+    }
+
+    #[heliod_operation(
+        peripheral = super::heliod_model::Nrf52UarteCost,
+        from = ActiveRx,
+        to = ActiveIdle,
+        cost = 3
+    )]
+    async fn finish_rx(
+        _registers: &Nrf52UarteRegisters,
+        r: pac::uarte::Uarte,
+        state: &'static State,
+    ) -> Result<(), Error> {
+        let result = poll_fn(|cx| {
+            state.rx_waker.register(cx.waker());
+            let errors = r.errorsrc().read();
+            if errors.0 != 0 {
+                r.errorsrc().write_value(errors);
+                r.tasks_dma().rx().stop().write_value(1);
+                return Poll::Ready(ErrorSource::from_bits_truncate(errors.0).check());
+            }
+            if r.events_dma().rx().end().read() != 0 {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        if result.is_err() {
+            reset_to_idle(r);
+            state.rx_on.store(false, Ordering::Relaxed);
+        }
+        compiler_fence(Ordering::SeqCst);
+        r.events_dma().rx().ready().write_value(0);
+        result
+    }
+
+    #[heliod_operation(
+        peripheral = super::heliod_model::Nrf52UarteCost,
+        from = ActiveRx,
+        to = ActiveIdle,
+        cost = 7
+    )]
+    fn cancel_rx(_registers: &Nrf52UarteRegisters, r: pac::uarte::Uarte, state: &'static State) {
+        reset_to_idle(r);
+        r.events_dma().rx().end().write_value(0);
+        r.events_dma().rx().ready().write_value(0);
+        state.rx_on.store(false, Ordering::Relaxed);
+    }
+
+    pub(super) async fn read(
+        registers: &Nrf52UarteRegisters,
+        r: pac::uarte::Uarte,
+        state: &'static State,
+        buffer: &mut [u8],
+    ) -> Result<(), Error> {
+        start_rx(registers, r, state, buffer);
+        let on_drop = OnDrop::new(|| cancel_rx(registers, r, state));
+        let result = with_timeout(Duration::from_ticks(327_680), finish_rx(registers, r, state))
+            .await
+            .expect("UART receive timed out");
+        on_drop.defuse();
+        result
+    }
+}
 
 /// The maximum buffer size (in bytes) that the UARTE EasyDMA can transfer in one operation.
 pub const DMA_SIZE: usize = crate::util::easy_dma_max!(RxMaxcnt, set_maxcnt, maxcnt);
@@ -161,6 +393,8 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 pub struct Uarte<'d, M: Mode> {
     tx: UarteTx<'d, M>,
     rx: UarteRx<'d, M>,
+    #[cfg(feature = "time")]
+    registers: Nrf52UarteRegisters,
 }
 
 /// Transmitter part of the UARTE driver.
@@ -219,7 +453,19 @@ impl<'d> Uarte<'d, Async> {
 
     /// Read bytes until the buffer is filled.
     pub async fn read(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
-        self.rx.read(buffer).await
+        #[cfg(not(feature = "time"))]
+        return self.rx.read(buffer).await;
+
+        #[cfg(feature = "time")]
+        {
+            if buffer.is_empty() {
+                return Ok(());
+            }
+            if buffer.len() > DMA_SIZE {
+                return Err(Error::BufferTooLong);
+            }
+            heliod_checked::read(&self.registers, self.rx.r, self.rx.state, buffer).await
+        }
     }
 
     /// Flush the RX FIFO to RAM without activating the receiver.
@@ -229,12 +475,35 @@ impl<'d> Uarte<'d, Async> {
 
     /// Write all bytes in the buffer.
     pub async fn write(&mut self, buffer: &[u8]) -> Result<(), Error> {
-        self.tx.write(buffer).await
+        match self.write_from_ram(buffer).await {
+            Ok(_) => Ok(()),
+            Err(Error::BufferNotInRAM) => {
+                trace!("Copying UARTE tx buffer into RAM for DMA");
+                let ram_buf = &mut [0; FORCE_COPY_BUFFER_SIZE][..buffer.len()];
+                ram_buf.copy_from_slice(buffer);
+                self.write_from_ram(ram_buf).await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Same as [`write`](Uarte::write) but will fail instead of copying data into RAM. Consult the module level documentation to learn more.
     pub async fn write_from_ram(&mut self, buffer: &[u8]) -> Result<(), Error> {
-        self.tx.write_from_ram(buffer).await
+        #[cfg(not(feature = "time"))]
+        return self.tx.write_from_ram(buffer).await;
+
+        #[cfg(feature = "time")]
+        {
+            if buffer.is_empty() {
+                return Ok(());
+            }
+            slice_in_ram_or(buffer, Error::BufferNotInRAM)?;
+            if buffer.len() > DMA_SIZE {
+                return Err(Error::BufferTooLong);
+            }
+            heliod_checked::write_from_ram(&self.registers, self.tx.r, self.tx.state, buffer).await;
+            Ok(())
+        }
     }
 }
 
@@ -305,6 +574,12 @@ impl<'d, M: Mode> Uarte<'d, M> {
                 r: T::regs(),
                 state: T::state(),
                 _p: PhantomData,
+            },
+            #[cfg(feature = "time")]
+            registers: {
+                // SAFETY: `uarte` provides exclusive ownership and construction
+                // leaves the peripheral enabled with both DMA directions idle.
+                unsafe { Nrf52UarteRegisters::new(r) }
             },
         }
     }
