@@ -5,6 +5,10 @@ version = "0.1.0"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+power-benchmark-efficient = []
+power-benchmark-no-heliod = []
+
 [dependencies]
 embassy-futures = { version = "0.1.2", path = "../../embassy-futures" }
 embassy-sync = { version = "0.8.0", path = "../../embassy-sync", features = ["defmt"] }
