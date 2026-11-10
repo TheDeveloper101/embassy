@@ -22,7 +22,8 @@ mod checked {
         peripheral = Nrf52UarteCost,
         from = ActiveIdle,
         to = ActiveIdle,
-        cost = 1310739
+        cost = 131091,
+        background_steps = 32773
     )]
     async fn read(uart: &mut uarte::Uarte<'_, embassy_nrf::mode::Async>, buffer: &mut [u8]) {
         unwrap!(uart.read(buffer).await);
@@ -32,7 +33,8 @@ mod checked {
         peripheral = Nrf52UarteCost,
         from = ActiveIdle,
         to = ActiveIdle,
-        cost = 1310736
+        cost = 144,
+        background_steps = 36
     )]
     async fn write(uart: &mut uarte::Uarte<'_, embassy_nrf::mode::Async>, buffer: &[u8]) {
         unwrap!(uart.write(buffer).await);

@@ -122,6 +122,26 @@ mod heliod_checked {
 
     #[heliod_operation(
         peripheral = super::heliod_model::Nrf52UarteCost,
+        from = Off,
+        to = ActiveIdle,
+        cost = 1
+    )]
+    pub(super) fn resume(_registers: &Nrf52UarteRegisters, r: pac::uarte::Uarte) {
+        r.enable().write(|w| w.set_enable(vals::Enable::Enabled));
+    }
+
+    #[heliod_operation(
+        peripheral = super::heliod_model::Nrf52UarteCost,
+        from = ActiveIdle,
+        to = Off,
+        cost = 1
+    )]
+    pub(super) fn suspend(_registers: &Nrf52UarteRegisters, r: pac::uarte::Uarte) {
+        r.enable().write(|w| w.set_enable(vals::Enable::Disabled));
+    }
+
+    #[heliod_operation(
+        peripheral = super::heliod_model::Nrf52UarteCost,
         from = ActiveIdle,
         to = ActiveTx,
         cost = 5
@@ -177,7 +197,9 @@ mod heliod_checked {
     ) {
         start_tx(registers, r, buffer);
         let on_drop = OnDrop::new(|| cancel_tx(registers, r));
-        with_timeout(Duration::from_ticks(327_680), finish_tx(registers, r, state))
+        // Eight bytes at 115200 baud with 8-N-1 framing take 23 RTC1
+        // ticks. The artifact workload uses 32 ticks to include margin.
+        with_timeout(Duration::from_ticks(32), finish_tx(registers, r, state))
             .await
             .expect("UART transmit timed out");
         on_drop.defuse();
@@ -260,7 +282,9 @@ mod heliod_checked {
     ) -> Result<(), Error> {
         start_rx(registers, r, state, buffer);
         let on_drop = OnDrop::new(|| cancel_rx(registers, r, state));
-        let result = with_timeout(Duration::from_ticks(327_680), finish_rx(registers, r, state))
+        // RX depends on an external sender. The artifact assumes that the
+        // complete buffer arrives within one second at the 32768 Hz RTC1 rate.
+        let result = with_timeout(Duration::from_ticks(32_768), finish_rx(registers, r, state))
             .await
             .expect("UART receive timed out");
         on_drop.defuse();
@@ -504,6 +528,22 @@ impl<'d> Uarte<'d, Async> {
             heliod_checked::write_from_ram(&self.registers, self.tx.r, self.tx.state, buffer).await;
             Ok(())
         }
+    }
+
+    /// Disable an idle UART so it does not incur its active background cost.
+    ///
+    /// Heliod checks that analyzed callers invoke this only from `ActiveIdle`.
+    #[cfg(feature = "time")]
+    pub fn suspend(&mut self) {
+        heliod_checked::suspend(&self.registers, self.tx.r);
+    }
+
+    /// Re-enable a UART that was suspended with [`Self::suspend`].
+    ///
+    /// Heliod checks that analyzed callers invoke this only from `Off`.
+    #[cfg(feature = "time")]
+    pub fn resume(&mut self) {
+        heliod_checked::resume(&self.registers, self.tx.r);
     }
 }
 
