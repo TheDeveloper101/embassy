@@ -1,19 +1,13 @@
 #![no_std]
 #![no_main]
 
-#[cfg(not(feature = "power-benchmark-no-heliod"))]
-use abacus_registers::heliod;
-use abacus_registers::{heliod_ignore, heliod_operation};
+use abacus_registers::{heliod, heliod_ignore, heliod_operation};
 use embassy_executor::Spawner;
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::mode::Async;
 use embassy_nrf::peripherals::UARTE0;
-#[cfg(not(feature = "power-benchmark-no-heliod"))]
-use embassy_nrf::temp::Nrf5xTempCost;
-use embassy_nrf::temp::Temp;
-#[cfg(not(feature = "power-benchmark-no-heliod"))]
-use embassy_nrf::uarte::Nrf52UarteCost;
-use embassy_nrf::uarte::Uarte;
+use embassy_nrf::temp::{Nrf5xTempCost, Temp};
+use embassy_nrf::uarte::{Nrf52UarteCost, Uarte};
 use embassy_nrf::{bind_interrupts, temp, uarte};
 use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
@@ -39,9 +33,7 @@ fn format_temperature_x4(value: i32, buffer: &mut [u8; 8]) {
     buffer[7] = b'\n';
 }
 
-// Removing this one attribute gives the matched application-analysis baseline.
-// The operation contracts and the executable workload remain in both builds.
-#[cfg_attr(not(feature = "power-benchmark-no-heliod"), heliod(Nrf5xTempCost, Nrf52UarteCost))]
+#[heliod(Nrf5xTempCost, Nrf52UarteCost)]
 mod workload {
     #![allow(dead_code)]
 
