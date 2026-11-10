@@ -31,7 +31,7 @@ embedded-hal-bus = { version = "0.3", features = ["async"] }
 num-integer = { version = "0.1.45", default-features = false }
 microfft = "0.6.0"
 portable-atomic = "1"
-abacus-registers = { git = "https://github.com/TheDeveloper101/embassy.git", rev = "208514a1c12b9cb53dcc1827ca5993344c6e485b" }
+abacus-registers = { git = "https://github.com/TheDeveloper101/abacus-registers.git", rev = "208514a1c12b9cb53dcc1827ca5993344c6e485b" }
 
 [profile.release]
 debug = 2
