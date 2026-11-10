@@ -85,6 +85,7 @@ mod checked {
         resume(uart);
         let value = read_temperature(temp).await;
         heliod_ignore!(format_temperature_x4(value, buffer));
+        heliod_ignore!(info!("UART TX temperature x4: {}", value));
         write(uart, buffer).await;
         suspend(uart);
     }
@@ -93,6 +94,7 @@ mod checked {
     pub async fn optimized_iteration(temp: &mut Temp<'_>, uart: &mut Uarte<'_, Async>, buffer: &mut [u8; 8]) {
         let value = read_temperature(temp).await;
         heliod_ignore!(format_temperature_x4(value, buffer));
+        heliod_ignore!(info!("UART TX temperature x4: {}", value));
         resume(uart);
         write(uart, buffer).await;
         suspend(uart);
@@ -102,6 +104,7 @@ mod checked {
     pub async fn late_suspend_iteration(temp: &mut Temp<'_>, uart: &mut Uarte<'_, Async>, buffer: &mut [u8; 8]) {
         let value = read_temperature(temp).await;
         heliod_ignore!(format_temperature_x4(value, buffer));
+        heliod_ignore!(info!("UART TX temperature x4: {}", value));
         resume(uart);
         write(uart, buffer).await;
         let _unused = read_temperature(temp).await;
@@ -116,6 +119,7 @@ mod checked {
     ) {
         let value = read_temperature(temp).await;
         heliod_ignore!(format_temperature_x4(value, buffer));
+        heliod_ignore!(info!("UART TX temperature x4: {}", value));
         resume(uart);
         write(uart, buffer).await;
         suspend(uart);
