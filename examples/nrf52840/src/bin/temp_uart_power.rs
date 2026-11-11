@@ -1,19 +1,14 @@
 #![no_std]
 #![no_main]
 
-use abacus_registers::{heliod, heliod_ignore, heliod_operation};
+use abacus_registers::{heliod, heliod_ignore, heliod_loop, heliod_operation};
 use embassy_executor::Spawner;
-use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::mode::Async;
 use embassy_nrf::peripherals::UARTE0;
 use embassy_nrf::temp::{Nrf5xTempCost, Temp};
 use embassy_nrf::uarte::{Nrf52UarteCost, Uarte};
 use embassy_nrf::{bind_interrupts, temp, uarte};
-use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
-
-const WARMUP_ITERATIONS: usize = 10;
-const MEASURED_ITERATIONS: usize = 1_000;
 
 bind_interrupts!(struct Irqs {
     TEMP => temp::InterruptHandler;
@@ -83,6 +78,9 @@ mod workload {
 
     pub async fn inefficient(temp: &mut Temp<'_>, uart: &mut Uarte<'_, Async>, buffer: &mut [u8; 8]) {
         resume(uart);
+        let _ = heliod_loop!(49, {
+            read_temperature(temp).await;
+        });
         let value = read_temperature(temp).await;
         heliod_ignore!(format_temperature_x4(value, buffer));
         write(uart, buffer).await;
@@ -90,6 +88,9 @@ mod workload {
     }
 
     pub async fn efficient(temp: &mut Temp<'_>, uart: &mut Uarte<'_, Async>, buffer: &mut [u8; 8]) {
+        let _ = heliod_loop!(49, {
+            read_temperature(temp).await;
+        });
         let value = read_temperature(temp).await;
         heliod_ignore!(format_temperature_x4(value, buffer));
         resume(uart);
@@ -109,9 +110,6 @@ async fn iteration(temp: &mut Temp<'_>, uart: &mut Uarte<'_, Async>, buffer: &mu
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
-    // P0.03 is high only during the measured block. Connect it and GND to the
-    // power instrument's digital input. The input must be high impedance.
-    let mut measurement_gate = Output::new(p.P0_03, Level::Low, OutputDrive::Standard);
     let mut temp = Temp::new(p.TEMP, Irqs);
     let mut uart = Uarte::new(p.UARTE0, p.P0_06, p.P0_08, Irqs, uarte::Config::default());
     let mut buffer = [0; 8];
@@ -120,19 +118,11 @@ async fn main(_spawner: Spawner) {
     // entry and restore Off before returning.
     uart.suspend();
 
-    for _ in 0..WARMUP_ITERATIONS {
-        iteration(&mut temp, &mut uart, &mut buffer).await;
-    }
+    iteration(&mut temp, &mut uart, &mut buffer).await;
+    drop(uart);
+    drop(temp);
 
-    // Make the start edge easy to identify after reset and initialization.
-    Timer::after_secs(2).await;
-    measurement_gate.set_high();
-    for _ in 0..MEASURED_ITERATIONS {
-        iteration(&mut temp, &mut uart, &mut buffer).await;
-    }
-    measurement_gate.set_low();
-
-    // Leave a quiet, recognizable tail in the capture and never repeat the run.
+    // Leave a quiet tail in the PPK2 capture and never repeat the workload.
     loop {
         cortex_m::asm::wfe();
     }
